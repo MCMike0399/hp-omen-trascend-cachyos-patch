@@ -1,0 +1,59 @@
+--- /home/mcmike/hp-wmi-dkms/hp-wmi-stock.c	2026-03-22 16:58:07.256276047 -0600
++++ /home/mcmike/hp-wmi-dkms/hp-wmi.c	2026-03-22 16:59:21.191613573 -0600
+@@ -133,6 +133,7 @@
+ 	"8900", "8901", "8902", "8912", "8917", "8918", "8949", "894A", "89EB",
+ 	"8A15", "8A42",
+ 	"8BAD",
++	"8C58", /* HP Omen Transcend Gaming Laptop 14-fb0xxx */
+ };
+ 
+ /* DMI Board names of Omen laptops that are specifically set to be thermal
+@@ -366,6 +367,7 @@
+ static DEFINE_MUTEX(active_platform_profile_lock);
+ 
+ static struct input_dev *hp_wmi_input_dev;
++static bool hp_wmi_event_handler_installed;
+ static struct input_dev *camera_shutter_input_dev;
+ static struct platform_device *hp_wmi_platform_dev;
+ static struct device *platform_profile_device;
+@@ -1160,18 +1162,25 @@
+ 
+ 	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
+ 	if (ACPI_FAILURE(status)) {
+-		err = -EIO;
+-		goto err_free_dev;
++		/*
++		 * On some boards (e.g. 8C58 - HP Omen Transcend 14) the WMI
++		 * event handler registration fails, but the rest of the driver
++		 * (thermal profiles, platform device) works fine. Don't abort
++		 * module init over this - just log and continue without hotkey
++		 * event support.
++		 */
++		pr_warn("Failed to register WMI notify handler: %s (continuing without hotkey events)\n",
++			acpi_format_exception(status));
++	} else {
++		hp_wmi_event_handler_installed = true;
+ 	}
+ 
+ 	err = input_register_device(hp_wmi_input_dev);
+ 	if (err)
+-		goto err_uninstall_notifier;
++		goto err_free_dev;
+ 
+ 	return 0;
+ 
+- err_uninstall_notifier:
+-	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+  err_free_dev:
+ 	input_free_device(hp_wmi_input_dev);
+ 	return err;
+@@ -1179,7 +1188,8 @@
+ 
+ static void hp_wmi_input_destroy(void)
+ {
+-	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
++	if (hp_wmi_event_handler_installed)
++		wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+ 	input_unregister_device(hp_wmi_input_dev);
+ }
+ 
