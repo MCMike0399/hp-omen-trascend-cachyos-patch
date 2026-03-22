@@ -152,6 +152,7 @@ static const char * const omen_thermal_profile_force_v0_boards[] = {
 static const char * const omen_timed_thermal_profile_boards[] = {
 	"8A15", "8A42",
 	"8BAD",
+	"8C58", /* HP Omen Transcend 14 - EC resets profile to balanced */
 };
 
 /* DMI Board names of Victus 16-d1xxx laptops */
@@ -1433,10 +1434,15 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
 }
 
+static int victus_s_gpu_thermal_profile_set(bool ctgp_enable,
+					    bool ppab_enable,
+					    u8 dstate);
+
 static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 {
 	int err, tp, tp_version;
 	enum hp_thermal_profile_omen_flags flags = 0;
+	bool gpu_ctgp_enable, gpu_ppab_enable;
 
 	tp_version = omen_get_thermal_policy_version();
 
@@ -1449,18 +1455,24 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
+		gpu_ctgp_enable = true;
+		gpu_ppab_enable = true;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		if (tp_version == 0)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_DEFAULT;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+		gpu_ctgp_enable = false;
+		gpu_ppab_enable = true;
 		break;
 	case PLATFORM_PROFILE_COOL:
 		if (tp_version == 0)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_COOL;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_COOL;
+		gpu_ctgp_enable = false;
+		gpu_ppab_enable = false;
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1469,6 +1481,33 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 	err = omen_thermal_profile_set(tp);
 	if (err < 0)
 		return err;
+
+	/*
+	 * On some boards (e.g. 8C58) the WMI thermal profile set command
+	 * succeeds but doesn't actually update the EC register. Write the
+	 * thermal profile value directly to the EC as a fallback to ensure
+	 * the firmware sees the change.
+	 */
+	err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_OFFSET, tp);
+	if (err)
+		pr_warn("Failed to write EC thermal profile directly: %d\n", err);
+
+	/*
+	 * Enable/disable GPU ctgp (Configurable TGP) and ppab (Power
+	 * Performance Adjustment Boost) to allow nvidia-powerd Dynamic Boost
+	 * to negotiate the full GPU power budget. Without this, the GPU is
+	 * limited to base TGP + minimal Dynamic Boost headroom (~10W) even
+	 * in performance mode. With ctgp enabled, the full ctgp offset
+	 * (up to 30W on some models) becomes available.
+	 *
+	 * This uses the same WMI query (0x22) as the Victus S path.
+	 * If the firmware doesn't support it, it will return an error
+	 * which we can safely ignore.
+	 */
+	err = victus_s_gpu_thermal_profile_set(gpu_ctgp_enable,
+					       gpu_ppab_enable, 1);
+	if (err < 0 && err != -EINVAL)
+		pr_debug("GPU ctgp/ppab set returned %d (may not be supported on this board)\n", err);
 
 	if (has_omen_thermal_profile_ec_timer()) {
 		err = omen_thermal_profile_ec_timer_set(0);
