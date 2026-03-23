@@ -1725,6 +1725,10 @@ static int victus_s_gpu_thermal_profile_get(bool *ctgp_enable,
 		*ppab_enable = gpu_power_modes.ppab_enable ? true : false;
 		*dstate = gpu_power_modes.dstate;
 		*gpu_slowdown_temp = gpu_power_modes.gpu_slowdown_temp;
+		pr_info("GPU thermal GET: ctgp=%d ppab=%d dstate=%d slowdown_temp=%d (0x%02x)\n",
+			gpu_power_modes.ctgp_enable, gpu_power_modes.ppab_enable,
+			gpu_power_modes.dstate, gpu_power_modes.gpu_slowdown_temp,
+			gpu_power_modes.gpu_slowdown_temp);
 	}
 
 	return ret;
@@ -1740,20 +1744,25 @@ static int victus_s_gpu_thermal_profile_set(bool ctgp_enable,
 	bool current_ctgp_state, current_ppab_state;
 	u8 current_dstate, current_gpu_slowdown_temp;
 
-	/* Retrieving GPU slowdown temperature, in order to keep it unchanged */
-	ret = victus_s_gpu_thermal_profile_get(&current_ctgp_state,
-					       &current_ppab_state,
-					       &current_dstate,
-					       &current_gpu_slowdown_temp);
-	if (ret < 0) {
-		pr_warn("GPU modes not updated, unable to get slowdown temp\n");
-		return ret;
-	}
-
+	/*
+	 * HP Omen Transcend 14 (8C58) BIOS bug: the GET query (WMI 0x21)
+	 * returns a conservative gpu_slowdown_temp (~53°C) that, when passed
+	 * back via SET (WMI 0x22), gets written to ACPI GPSV on the dGPU.
+	 * The NVIDIA driver reads GPSV via GPS _DSM subfunction 0x2A as the
+	 * TGPU thermal limit, causing permanent SW Thermal Slowdown at 53°C
+	 * despite the VBIOS slowdown being 91°C and target being 87°C.
+	 *
+	 * Fix: override gpu_slowdown_temp to 0x57 (87°C), matching the GPU
+	 * target temperature from the VBIOS. This value flows through:
+	 *   WMI 0x22 byte[3] → DSDT GM22 → GPSV → GPS _DSM TGPU → driver
+	 */
 	gpu_power_modes.ctgp_enable = ctgp_enable ? 0x01 : 0x00;
 	gpu_power_modes.ppab_enable = ppab_enable ? 0x01 : 0x00;
 	gpu_power_modes.dstate = dstate;
-	gpu_power_modes.gpu_slowdown_temp = current_gpu_slowdown_temp;
+	gpu_power_modes.gpu_slowdown_temp = 0x57; /* 87°C: GPU target temp */
+
+	pr_info("GPU thermal modes: ctgp=%d ppab=%d dstate=%d slowdown_temp=87°C (0x57)\n",
+		ctgp_enable, ppab_enable, dstate);
 
 
 	ret = hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
