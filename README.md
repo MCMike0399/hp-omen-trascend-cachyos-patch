@@ -294,6 +294,18 @@ prime-run %command%
 - **Coexistence:** Works alongside the [`omen-rgb-keyboard`](https://github.com/alessandromrc/omen-rgb-keyboard) driver — both modules load without conflict (hp_wmi is NOT blacklisted)
 - **Note:** This laptop worked correctly on Nobara (Fedora-based) previously, suggesting different kernel config or ACPI handling
 
+## Related Projects
+
+This repo is part of a set of tools for running the HP Omen Transcend 14 on Linux:
+
+| Repo | Purpose |
+|------|---------|
+| **[hp-omen-trascend-cachyos-patch](https://github.com/MCMike0399/hp-omen-trascend-cachyos-patch)** (this repo) | Patched `hp-wmi` kernel module — fixes GPU power (35W→65W), enables `platform_profile`, adds manual fan speed control via hwmon |
+| **[omen-fan-curve](https://github.com/MCMike0399/omen-fan-curve)** | Temperature-based fan curve daemon + KDE Plasma 6 widget. **Requires this repo's patched module** for fan speed control (hwmon `pwm1`) |
+| **[omen-rgb-keyboard](https://github.com/alessandromrc/omen-rgb-keyboard)** | 4-zone RGB keyboard driver. Coexists with the patched hp-wmi module without conflict |
+
+**Install order:** This repo first (kernel module), then omen-fan-curve (fan daemon + widget).
+
 ## Upstream Status
 
 These changes could be split into separate patches for upstream submission to `platform-drivers-x86@vger.kernel.org`:
