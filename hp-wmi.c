@@ -703,6 +703,29 @@ static int hp_wmi_fan_speed_reset(void)
 	return ret;
 }
 
+/*
+ * Set fan speed to a specific percentage (0-100) via WMI query 0x2E.
+ * Value 0 = automatic. Values 1-100 = manual speed percentage.
+ * Both fans are set to the same speed.
+ */
+static int hp_wmi_fan_speed_set(u8 speed_pct)
+{
+	u8 fan_speed[2] = { speed_pct, speed_pct };
+	int ret;
+
+	if (speed_pct > 100)
+		return -EINVAL;
+
+	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+				   &fan_speed, sizeof(fan_speed), 0);
+
+	return ret;
+}
+
+/* Track current manual fan speed for hwmon reads */
+static u8 hp_wmi_manual_fan_speed; /* 0 = auto/max, 1-100 = manual pct */
+static bool hp_wmi_fan_manual_mode;
+
 static int hp_wmi_fan_speed_max_reset(void)
 {
 	int ret;
@@ -2246,20 +2269,33 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 		*val = ret;
 		return 0;
 	case hwmon_pwm:
-		switch (hp_wmi_fan_speed_max_get()) {
-		case 0:
-			/* 0 is automatic fan, which is 2 for hwmon */
-			*val = 2;
-			return 0;
-		case 1:
-			/* 1 is max fan, which is 0
-			 * (no fan speed control) for hwmon
-			 */
-			*val = 0;
+		switch (attr) {
+		case hwmon_pwm_enable:
+			if (hp_wmi_fan_manual_mode) {
+				*val = 1; /* manual */
+				return 0;
+			}
+			switch (hp_wmi_fan_speed_max_get()) {
+			case 0:
+				*val = 2; /* automatic */
+				return 0;
+			case 1:
+				*val = 0; /* full speed */
+				return 0;
+			default:
+				return -ENODATA;
+			}
+		case hwmon_pwm_input:
+			if (hp_wmi_fan_manual_mode)
+				/* Convert 0-100% to 0-255 */
+				*val = hp_wmi_manual_fan_speed * 255 / 100;
+			else if (hp_wmi_fan_speed_max_get() == 1)
+				*val = 255; /* full speed */
+			else
+				*val = 0; /* auto: report 0 */
 			return 0;
 		default:
-			/* shouldn't happen */
-			return -ENODATA;
+			return -EINVAL;
 		}
 	default:
 		return -EINVAL;
@@ -2269,23 +2305,52 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 			      u32 attr, int channel, long val)
 {
+	int ret;
+
 	switch (type) {
 	case hwmon_pwm:
-		switch (val) {
-		case 0:
-			if (is_victus_s_thermal_profile())
+		switch (attr) {
+		case hwmon_pwm_enable:
+			switch (val) {
+			case 0:
+				/* Full speed */
+				hp_wmi_fan_manual_mode = false;
+				if (is_victus_s_thermal_profile())
+					hp_wmi_get_fan_count_userdefine_trigger();
+				return hp_wmi_fan_speed_max_set(1);
+			case 1:
+				/* Manual mode - set to current speed or 50% default */
+				hp_wmi_fan_manual_mode = true;
+				if (!hp_wmi_manual_fan_speed)
+					hp_wmi_manual_fan_speed = 50;
 				hp_wmi_get_fan_count_userdefine_trigger();
-			/* 0 is no fan speed control (max), which is 1 for us */
-			return hp_wmi_fan_speed_max_set(1);
-		case 2:
-			/* 2 is automatic speed control, which is 0 for us */
-			if (is_victus_s_thermal_profile()) {
-				hp_wmi_get_fan_count_userdefine_trigger();
-				return hp_wmi_fan_speed_max_reset();
-			} else
-				return hp_wmi_fan_speed_max_set(0);
+				return hp_wmi_fan_speed_set(hp_wmi_manual_fan_speed);
+			case 2:
+				/* Automatic */
+				hp_wmi_fan_manual_mode = false;
+				hp_wmi_manual_fan_speed = 0;
+				if (is_victus_s_thermal_profile()) {
+					hp_wmi_get_fan_count_userdefine_trigger();
+					return hp_wmi_fan_speed_max_reset();
+				} else
+					return hp_wmi_fan_speed_max_set(0);
+			default:
+				return -EINVAL;
+			}
+		case hwmon_pwm_input:
+			/* Set fan speed: hwmon uses 0-255, WMI uses 0-100% */
+			if (val < 0 || val > 255)
+				return -EINVAL;
+			hp_wmi_manual_fan_speed = (u8)(val * 100 / 255);
+			if (hp_wmi_manual_fan_speed < 1 && val > 0)
+				hp_wmi_manual_fan_speed = 1;
+			hp_wmi_fan_manual_mode = true;
+			hp_wmi_get_fan_count_userdefine_trigger();
+			ret = hp_wmi_fan_speed_set(hp_wmi_manual_fan_speed);
+			if (ret)
+				return ret;
+			return 0;
 		default:
-			/* we don't support manual fan speed control */
 			return -EINVAL;
 		}
 	default:
@@ -2295,7 +2360,7 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 
 static const struct hwmon_channel_info * const info[] = {
 	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
-	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE),
+	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE | HWMON_PWM_INPUT),
 	NULL
 };
 

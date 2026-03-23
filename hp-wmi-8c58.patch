@@ -1,5 +1,5 @@
 --- hp-wmi-stock.c	2026-03-22 16:58:07.256276047 -0600
-+++ hp-wmi.c	2026-03-22 17:38:01.171184705 -0600
++++ hp-wmi.c	2026-03-22 18:16:33.593548796 -0600
 @@ -133,6 +133,7 @@
  	"8900", "8901", "8902", "8912", "8917", "8918", "8949", "894A", "89EB",
  	"8A15", "8A42",
@@ -24,7 +24,37 @@
  static struct input_dev *camera_shutter_input_dev;
  static struct platform_device *hp_wmi_platform_dev;
  static struct device *platform_profile_device;
-@@ -1160,18 +1163,25 @@
+@@ -700,6 +703,29 @@
+ 	return ret;
+ }
+ 
++/*
++ * Set fan speed to a specific percentage (0-100) via WMI query 0x2E.
++ * Value 0 = automatic. Values 1-100 = manual speed percentage.
++ * Both fans are set to the same speed.
++ */
++static int hp_wmi_fan_speed_set(u8 speed_pct)
++{
++	u8 fan_speed[2] = { speed_pct, speed_pct };
++	int ret;
++
++	if (speed_pct > 100)
++		return -EINVAL;
++
++	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
++				   &fan_speed, sizeof(fan_speed), 0);
++
++	return ret;
++}
++
++/* Track current manual fan speed for hwmon reads */
++static u8 hp_wmi_manual_fan_speed; /* 0 = auto/max, 1-100 = manual pct */
++static bool hp_wmi_fan_manual_mode;
++
+ static int hp_wmi_fan_speed_max_reset(void)
+ {
+ 	int ret;
+@@ -1160,18 +1186,25 @@
  
  	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
  	if (ACPI_FAILURE(status)) {
@@ -55,7 +85,7 @@
   err_free_dev:
  	input_free_device(hp_wmi_input_dev);
  	return err;
-@@ -1179,7 +1189,8 @@
+@@ -1179,7 +1212,8 @@
  
  static void hp_wmi_input_destroy(void)
  {
@@ -65,7 +95,7 @@
  	input_unregister_device(hp_wmi_input_dev);
  }
  
-@@ -1423,10 +1434,15 @@
+@@ -1423,10 +1457,15 @@
  	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
  }
  
@@ -81,7 +111,7 @@
  
  	tp_version = omen_get_thermal_policy_version();
  
-@@ -1439,18 +1455,24 @@
+@@ -1439,18 +1478,24 @@
  			tp = HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE;
  		else
  			tp = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
@@ -106,7 +136,7 @@
  		break;
  	default:
  		return -EOPNOTSUPP;
-@@ -1460,6 +1482,33 @@
+@@ -1460,6 +1505,33 @@
  	if (err < 0)
  		return err;
  
@@ -140,3 +170,124 @@
  	if (has_omen_thermal_profile_ec_timer()) {
  		err = omen_thermal_profile_ec_timer_set(0);
  		if (err < 0)
+@@ -2197,20 +2269,33 @@
+ 		*val = ret;
+ 		return 0;
+ 	case hwmon_pwm:
+-		switch (hp_wmi_fan_speed_max_get()) {
+-		case 0:
+-			/* 0 is automatic fan, which is 2 for hwmon */
+-			*val = 2;
+-			return 0;
+-		case 1:
+-			/* 1 is max fan, which is 0
+-			 * (no fan speed control) for hwmon
+-			 */
+-			*val = 0;
++		switch (attr) {
++		case hwmon_pwm_enable:
++			if (hp_wmi_fan_manual_mode) {
++				*val = 1; /* manual */
++				return 0;
++			}
++			switch (hp_wmi_fan_speed_max_get()) {
++			case 0:
++				*val = 2; /* automatic */
++				return 0;
++			case 1:
++				*val = 0; /* full speed */
++				return 0;
++			default:
++				return -ENODATA;
++			}
++		case hwmon_pwm_input:
++			if (hp_wmi_fan_manual_mode)
++				/* Convert 0-100% to 0-255 */
++				*val = hp_wmi_manual_fan_speed * 255 / 100;
++			else if (hp_wmi_fan_speed_max_get() == 1)
++				*val = 255; /* full speed */
++			else
++				*val = 0; /* auto: report 0 */
+ 			return 0;
+ 		default:
+-			/* shouldn't happen */
+-			return -ENODATA;
++			return -EINVAL;
+ 		}
+ 	default:
+ 		return -EINVAL;
+@@ -2220,23 +2305,52 @@
+ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+ 			      u32 attr, int channel, long val)
+ {
++	int ret;
++
+ 	switch (type) {
+ 	case hwmon_pwm:
+-		switch (val) {
+-		case 0:
+-			if (is_victus_s_thermal_profile())
+-				hp_wmi_get_fan_count_userdefine_trigger();
+-			/* 0 is no fan speed control (max), which is 1 for us */
+-			return hp_wmi_fan_speed_max_set(1);
+-		case 2:
+-			/* 2 is automatic speed control, which is 0 for us */
+-			if (is_victus_s_thermal_profile()) {
++		switch (attr) {
++		case hwmon_pwm_enable:
++			switch (val) {
++			case 0:
++				/* Full speed */
++				hp_wmi_fan_manual_mode = false;
++				if (is_victus_s_thermal_profile())
++					hp_wmi_get_fan_count_userdefine_trigger();
++				return hp_wmi_fan_speed_max_set(1);
++			case 1:
++				/* Manual mode - set to current speed or 50% default */
++				hp_wmi_fan_manual_mode = true;
++				if (!hp_wmi_manual_fan_speed)
++					hp_wmi_manual_fan_speed = 50;
+ 				hp_wmi_get_fan_count_userdefine_trigger();
+-				return hp_wmi_fan_speed_max_reset();
+-			} else
+-				return hp_wmi_fan_speed_max_set(0);
++				return hp_wmi_fan_speed_set(hp_wmi_manual_fan_speed);
++			case 2:
++				/* Automatic */
++				hp_wmi_fan_manual_mode = false;
++				hp_wmi_manual_fan_speed = 0;
++				if (is_victus_s_thermal_profile()) {
++					hp_wmi_get_fan_count_userdefine_trigger();
++					return hp_wmi_fan_speed_max_reset();
++				} else
++					return hp_wmi_fan_speed_max_set(0);
++			default:
++				return -EINVAL;
++			}
++		case hwmon_pwm_input:
++			/* Set fan speed: hwmon uses 0-255, WMI uses 0-100% */
++			if (val < 0 || val > 255)
++				return -EINVAL;
++			hp_wmi_manual_fan_speed = (u8)(val * 100 / 255);
++			if (hp_wmi_manual_fan_speed < 1 && val > 0)
++				hp_wmi_manual_fan_speed = 1;
++			hp_wmi_fan_manual_mode = true;
++			hp_wmi_get_fan_count_userdefine_trigger();
++			ret = hp_wmi_fan_speed_set(hp_wmi_manual_fan_speed);
++			if (ret)
++				return ret;
++			return 0;
+ 		default:
+-			/* we don't support manual fan speed control */
+ 			return -EINVAL;
+ 		}
+ 	default:
+@@ -2246,7 +2360,7 @@
+ 
+ static const struct hwmon_channel_info * const info[] = {
+ 	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
+-	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE),
++	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE | HWMON_PWM_INPUT),
+ 	NULL
+ };
+ 
